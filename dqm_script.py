@@ -9,24 +9,12 @@ from pyspark.sql.functions import col
 SOFT_FAIL = 0
 HARD_FAIL = 1 #DROPS/QURANTINE 
 
-#Define log schema for log_table
 
-LOG_SCHEMA = StructType([
-    StructField("batch_id",         LongType(),      True),
-    StructField("check_id",         LongType(),      True),
-    StructField("target_table",     StringType(),    True),
-    StructField("target_column",    StringType(),    True),
-    StructField("total_rows",       LongType(),      True),
-    StructField("passed_rows",      LongType(),      True),
-    StructField("failed_rows",      LongType(),      True),
-    StructField("threshold",        FloatType(),     True),
-    StructField("status",           StringType(),    True),
-    StructField("criticality",      IntegerType(),   True),
-    StructField("run_timestamp",    TimestampType(), True),
-    StructField("execution_time",   DoubleType(),    True),
-    StructField("quarantine_table", StringType(),    True),
-    StructField("passed_table",     StringType(),    True),
-])
+#psycopg2
+
+#Obtain the table_schema from the table in DB
+def get_table_schema(spark: SparkSession, table_name: str):
+    return spark.table(table_name).schema
 
 # create sparkSession
 def get_spark() -> SparkSession:
@@ -125,7 +113,8 @@ def classify_records(spark, source_df, hard_ids, soft_ids):
 #code to write to respective tables
 def persist_results(spark, log_records, dqm_logs_table, passed_df, passed_table, quarantined_df, quarantine_table):
     if log_records:
-        logs_df = spark.createDataFrame(log_records, schema=LOG_SCHEMA)
+        log_schema = get_table_schema(spark, dqm_logs_table)
+        logs_df = spark.createDataFrame(log_records, schema=log_schema)
         logs_df.write.format("delta").mode("append").saveAsTable(dqm_logs_table)
     
     passed_df.write.format("delta").mode("overwrite").saveAsTable(passed_table)
