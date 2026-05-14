@@ -7,10 +7,12 @@ from pyspark.sql.functions import col
 
 # Criticality levels
 SOFT_FAIL = 0
-HARD_FAIL = 1 #DROPS/QURANTINE 
+HARD_FAIL = 1 
 
 
 #psycopg2
+
+
 
 #Obtain the table_schema from the table in DB
 def get_table_schema(spark: SparkSession, table_name: str):
@@ -20,15 +22,17 @@ def get_table_schema(spark: SparkSession, table_name: str):
         for field in full_schema.fields
         if field.name != "log_id"
     ]
-
     return StructType(filtered_fields)
 
-# create sparkSession
+
+
+# create sparkSession & bactch_id
 def get_spark() -> SparkSession:
     return SparkSession.builder.getOrCreate()
-
 def generate_batch_id() -> int:
     return uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+
+
 
 # Check the config table
 def load_config(spark: SparkSession, dqm_config_table: str) -> DataFrame:
@@ -37,11 +41,14 @@ def load_config(spark: SparkSession, dqm_config_table: str) -> DataFrame:
         raise RuntimeError(f"No active configs in {dqm_config_table}")
     return df
 
+
+#load tables
 def load_checks(spark: SparkSession, dqm_checks_table: str) -> DataFrame:
     return spark.table(dqm_checks_table)
-
 def load_source(spark: SparkSession, source_table: str) -> DataFrame:
     return spark.table(source_table).dropDuplicates(["record_id"])
+
+
 
 def run_single_check(spark, source_df, config_row, checks_df, batch_id, run_timestamp, quarantine_table, passed_table):
 
@@ -59,7 +66,7 @@ def run_single_check(spark, source_df, config_row, checks_df, batch_id, run_time
     if not check_rows:
         return None, empty_ids, empty_ids
     
-    query_template = check_rows[0]["query_template"]
+    query_template = check_rows[0]["query_template"] 
     
     start_time = datetime.now()
     source_df.createOrReplaceTempView("source_table")
@@ -129,15 +136,15 @@ def persist_results(spark, log_records, dqm_logs_table, passed_df, passed_table,
 
 # function to bring it all together
 
-def run_dqm_pipeline(catalog="com_edp_dev", schema="com_raw"):
+def run_dqm_pipeline(catalog, schema,ctrl_dqm_master,ctrl_dqm_type,source,quarantine_table,passed_table,log_table):
     ns = f"{catalog}.{schema}"
     spark = get_spark()
     batch_id = generate_batch_id()
     run_timestamp = datetime.now()
     
-    config_df = load_config(spark, f"{ns}.dqm_config")
-    checks_df = load_checks(spark, f"{ns}.dqm_checks")
-    source_df = load_source(spark, f"{ns}.dqm_staging")
+    config_df = load_config(spark, f"{ns}.{ctrl_dqm_master}")
+    checks_df = load_checks(spark, f"{ns}.{ctrl_dqm_type}")
+    source_df = load_source(spark, f"{ns}.{source}")
 
     hard_ids = spark.createDataFrame([], StructType([StructField("record_id", StringType(), True)]))
     soft_ids = hard_ids
@@ -146,7 +153,7 @@ def run_dqm_pipeline(catalog="com_edp_dev", schema="com_raw"):
     for config_row in config_df.collect():
         log_record, r_hard, r_soft = run_single_check(
             spark, source_df, config_row, checks_df, batch_id, 
-            run_timestamp, f"{ns}.dqm_quarantined_records", f"{ns}.dqm_passed_records"
+            run_timestamp, f"{ns}.{quarantine_table}", f"{ns}.{passed_table}"
         )
         if log_record:
             log_records.append(log_record)
@@ -156,12 +163,12 @@ def run_dqm_pipeline(catalog="com_edp_dev", schema="com_raw"):
     passed_df, quarantined_df = classify_records(spark, source_df, hard_ids, soft_ids)
     
     persist_results(
-        spark, log_records, f"{ns}.dqm_logs", 
-        passed_df, f"{ns}.dqm_passed_records", 
-        quarantined_df, f"{ns}.dqm_quarantined_records"
+        spark, log_records, f"{ns}.{log_table}", 
+        passed_df, f"{ns}.{passed_table}", 
+        quarantined_df, f"{ns}.{quarantine_table}"
     )
 
     return {"batch_id": batch_id, "passed": passed_df.count(), "quarantined": quarantined_df.count()}
 
 #run
-run_dqm_pipeline()
+run_dqm_pipeline("com_edp_dev","com_raw","ctrl_dqm_master","ctrl_dqm_type","dqm_staging","dqm_quarantined_records","dqm_passed_records","dqm_logs")
