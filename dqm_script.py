@@ -1,9 +1,13 @@
 # yet to impliment best-practices and error-handeling 
 import uuid
+import json
+import re
 from datetime import datetime
 from pyspark.sql.types import *
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import *
+
+
 
 # Criticality levels
 SOFT_FAIL = 0
@@ -77,6 +81,28 @@ def run_single_check(spark, source_df, config_row, checks_df, batch_id, run_time
     # fill in the query template
     validation_query = query_template.replace("{table_name}", "source_table").replace("{column_name}", target_column)
     # will need to a additional check parameter eg. for length check - we'll need length for that column
+
+    #inject dynmaic params from check_params if present
+    raw_params = config_row["check_params"]
+
+    if raw_params:
+        try:
+            check_params = json.loads(raw_params)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in check_params for check_id={check_id}: {raw_params}") from e
+
+        for param_key, param_value in check_params.items():
+            placeholder = "{" + param_key + "}"
+            if placeholder in validation_query:
+                validation_query = validation_query.replace(placeholder, str(param_value))
+
+    # Catch any placeholders that weren't filled
+    unfilled = re.findall(r"\{(\w+)\}", validation_query)
+    if unfilled:
+        raise ValueError(
+            f"check_id={check_id} has unfilled placeholders {unfilled}. "
+            f"Add these keys to check_params in ctrl_dqm_master."
+        )
 
     # run the query   
     failed_record_ids = spark.sql(validation_query).select("record_id").distinct()
