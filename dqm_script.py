@@ -54,7 +54,8 @@ def load_source(spark: SparkSession, source_table: str) -> DataFrame:
 def run_single_check(spark, source_df, config_row, checks_df, batch_id, run_timestamp, quarantine_table, passed_table):
 
     # make placehold df for passed_record_ids and failed_record_ids
-    empty_ids = spark.createDataFrame([], StructType([StructField("record_id", StringType(), True)]))
+    record_id_field = source_df.schema["record_id"]
+    empty_ids = spark.createDataFrame([], StructType([record_id_field]))
     
     check_id      = config_row["check_id"]
     target_column = config_row["target_column"]
@@ -75,7 +76,7 @@ def run_single_check(spark, source_df, config_row, checks_df, batch_id, run_time
     
     # fill in the query template
     validation_query = query_template.replace("{table_name}", "source_table").replace("{column_name}", target_column)
-    
+    # will need to a additional check parameter eg. for length check - we'll need length for that column
 
     # run the query   
     failed_record_ids = spark.sql(validation_query).select("record_id").distinct()
@@ -90,7 +91,7 @@ def run_single_check(spark, source_df, config_row, checks_df, batch_id, run_time
     fail_pct = (failed_count / total_rows * 100) if total_rows > 0 else 0.0
     status = "FAIL" if fail_pct > threshold else "PASS"
 
-# create the record for the log table
+    # create the record for the log table
     log_record = {
         "batch_id": int(batch_id),
         "check_id": int(check_id),
@@ -147,7 +148,8 @@ def run_dqm_pipeline(catalog, schema,ctrl_dqm_master,ctrl_dqm_type,source,quaran
     checks_df = load_checks(spark, f"{ns}.{ctrl_dqm_type}")
     source_df = load_source(spark, f"{ns}.{source}")
 
-    hard_ids = spark.createDataFrame([], StructType([StructField("record_id", StringType(), True)]))
+    record_id_field = source_df.schema["record_id"]
+    hard_ids = spark.createDataFrame([], StructType([record_id_field]))
     soft_ids = hard_ids
     log_records = []
 
