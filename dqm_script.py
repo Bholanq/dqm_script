@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from pyspark.sql.types import *
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col
+from pyspark.sql.functions import *
 
 # Criticality levels
 SOFT_FAIL = 0
@@ -21,12 +21,13 @@ def get_table_schema(spark: SparkSession, table_name: str):
         field
         for field in full_schema.fields
         if field.name != "log_id"
+        # we ignore log_id as log_id is defined as an auto incremental column in the table
     ]
     return StructType(filtered_fields)
 
 
 
-# create sparkSession & bactch_id
+# create sparkSession & batcch_id
 def get_spark() -> SparkSession:
     return SparkSession.builder.getOrCreate()
 def generate_batch_id() -> int:
@@ -171,4 +172,11 @@ def run_dqm_pipeline(catalog, schema,ctrl_dqm_master,ctrl_dqm_type,source,quaran
     return {"batch_id": batch_id, "passed": passed_df.count(), "quarantined": quarantined_df.count()}
 
 #run
-run_dqm_pipeline("com_edp_dev","com_raw","ctrl_dqm_master","ctrl_dqm_type","dqm_staging","dqm_quarantined_records","dqm_passed_records","dqm_logs")
+run_dqm_pipeline("com_edp_dev"
+,"com_raw"
+,"ctrl_dqm_master"
+,"ctrl_dqm_type"
+,"dqm_staging"
+,"dqm_quarantined_records"
+,"dqm_passed_records"
+,"dqm_log")
