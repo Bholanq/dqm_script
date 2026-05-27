@@ -1,4 +1,3 @@
-  GNU nano 8.7.1                                                                                   connection_check.py
 import boto3
 import psycopg2
 from dotenv import load_dotenv
