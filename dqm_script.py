@@ -1,210 +1,488 @@
-# yet to impliment best-practices and error-handeling 
+# DQM pipeline — pure Python + psycopg2, no Spark/Delta required
+# Designed for bare EC2 inside the same VPC as the Redshift cluster
+#
+# Required .env variables:
+#   REDSHIFT_HOST, REDSHIFT_DATABASE, REDSHIFT_USER, REDSHIFT_CLUSTER_ID
+#   REDSHIFT_PORT  (optional, defaults to 5439)
+#
+# Usage:
+#   python dqm_script_ec2.py \
+#     --schema           dev \
+#     --ctrl_dqm_master  ctrl_dqm_master \
+#     --ctrl_dqm_type    ctrl_dqm_type \
+#     --source           dqm_staging \
+#     --quarantine_table dqm_quarantined_records \
+#     --passed_table     dqm_passed_records \
+#     --log_table        dqm_log
+
 import uuid
 import json
 import re
+import os
+import logging
+import argparse
+from contextlib import contextmanager
 from datetime import datetime
-from pyspark.sql.types import *
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import *
+
+import boto3
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
 
 
+load_dotenv("/home/ssm-user/dqm/.env")
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
 # Criticality levels
+# ---------------------------------------------------------------------------
 SOFT_FAIL = 0
-HARD_FAIL = 1 
+HARD_FAIL = 1
 
 
-#psycopg2
+# ---------------------------------------------------------------------------
+# Environment helpers
+# ---------------------------------------------------------------------------
+
+def _get_required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise EnvironmentError(
+            f"Required environment variable '{name}' is not set. "
+            "Check your .env file for: REDSHIFT_HOST, REDSHIFT_PORT, "
+            "REDSHIFT_DATABASE, REDSHIFT_USER, REDSHIFT_CLUSTER_ID"
+        )
+    return value
 
 
+# ---------------------------------------------------------------------------
+# Database connection — IAM temporary credentials via boto3
+# ---------------------------------------------------------------------------
 
-#Obtain the table_schema from the table in DB
-def get_table_schema(spark: SparkSession, table_name: str):
-    full_schema = spark.table(table_name).schema
-    filtered_fields = [
-        field
-        for field in full_schema.fields
-        if field.name != "log_id"
-        # we ignore log_id as log_id is defined as an auto incremental column in the table
-    ]
-    return StructType(filtered_fields)
+def get_db_conn() -> psycopg2.extensions.connection:
+    """Fetch IAM temp credentials from Redshift and return a psycopg2 connection."""
+    client = boto3.client("redshift", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+
+    creds = client.get_cluster_credentials(
+        DbUser=_get_required_env("REDSHIFT_USER"),
+        DbName=_get_required_env("REDSHIFT_DATABASE"),
+        ClusterIdentifier=_get_required_env("REDSHIFT_CLUSTER_ID"),
+        AutoCreate=False,
+    )
+
+    return psycopg2.connect(
+        host=_get_required_env("REDSHIFT_HOST"),
+        port=int(os.environ.get("REDSHIFT_PORT", "5439")),
+        dbname=_get_required_env("REDSHIFT_DATABASE"),
+        user=creds["DbUser"],
+        password=creds["DbPassword"],
+        sslmode="require",
+        connect_timeout=30,
+    )
 
 
+@contextmanager
+def db_cursor(conn: psycopg2.extensions.connection):
+    """Yield a RealDictCursor; rolls back on error so the connection stays usable."""
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
 
-# create sparkSession & batcch_id
-def get_spark() -> SparkSession:
-    return SparkSession.builder.getOrCreate()
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
+
 def generate_batch_id() -> int:
     return uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
 
 
+# ---------------------------------------------------------------------------
+# Control table + source loaders
+# ---------------------------------------------------------------------------
 
-# Check the config table
-def load_config(spark: SparkSession, dqm_config_table: str) -> DataFrame:
-    df = spark.table(dqm_config_table).filter(col("active") == True)
-    if df.isEmpty():
-        raise RuntimeError(f"No active configs in {dqm_config_table}")
-    return df
+def load_config(conn, schema: str, table: str) -> list[dict]:
+    """Load active rows from ctrl_dqm_master."""
+    sql = f'SELECT * FROM "{schema}"."{table}" WHERE active = TRUE'
+    with db_cursor(conn) as cur:
+        cur.execute(sql)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        raise RuntimeError(f"No active configs found in {schema}.{table}")
+
+    log.info("Loaded %d active config row(s) from %s.%s", len(rows), schema, table)
+    return rows
 
 
-#load tables
-def load_checks(spark: SparkSession, dqm_checks_table: str) -> DataFrame:
-    return spark.table(dqm_checks_table)
-def load_source(spark: SparkSession, source_table: str) -> DataFrame:
-    return spark.table(source_table).dropDuplicates(["record_id"])
+def load_checks(conn, schema: str, table: str) -> dict[int, dict]:
+    """Load ctrl_dqm_type and return a dict keyed by check_id."""
+    sql = f'SELECT * FROM "{schema}"."{table}"'
+    with db_cursor(conn) as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+
+    index = {int(r["check_id"]): dict(r) for r in rows}
+    log.info("Loaded %d check definition(s) from %s.%s", len(index), schema, table)
+    return index
 
 
+def load_source_ids(conn, schema: str, table: str) -> list[str]:
+    """
+    Return deduplicated record_ids from the source table.
+    Used to determine the total population for pass/fail classification.
+    """
+    sql = f"""
+        SELECT DISTINCT record_id
+        FROM "{schema}"."{table}"
+    """
+    with db_cursor(conn) as cur:
+        cur.execute(sql)
+        ids = [str(r["record_id"]) for r in cur.fetchall()]
 
-def run_single_check(spark, source_df, config_row, checks_df, batch_id, run_timestamp, quarantine_table, passed_table):
+    if not ids:
+        raise RuntimeError(f"Source table {schema}.{table} is empty or does not exist.")
 
-    # make placehold df for passed_record_ids and failed_record_ids
-    record_id_field = source_df.schema["record_id"]
-    empty_ids = spark.createDataFrame([], StructType([record_id_field]))
-    
-    check_id      = config_row["check_id"]
-    target_column = config_row["target_column"]
-    target_table  = config_row["target_table"]
+    log.info("Found %d distinct record_id(s) in %s.%s", len(ids), schema, table)
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# Core check execution  (pure SQL on Redshift — no Spark)
+# ---------------------------------------------------------------------------
+
+def run_single_check(
+    conn,
+    schema: str,
+    source_table: str,
+    config_row: dict,
+    checks_index: dict[int, dict],
+    total_rows: int,
+    batch_id: int,
+    run_timestamp: datetime,
+    quarantine_table: str,
+    passed_table: str,
+) -> tuple[dict | None, set[str]]:
+    """
+    Execute one DQM check directly on Redshift via psycopg2.
+
+    Returns
+    -------
+    (log_record | None, set of failed record_id strings)
+    """
+    check_id      = int(config_row["check_id"])
+    target_column = str(config_row["target_column"])
+    target_table  = str(config_row["target_table"])
     criticality   = int(config_row["criticality"])
-    threshold     = float(config_row["threshold"]) if config_row["threshold"] is not None else 0.0
+    threshold     = float(config_row["threshold"]) if config_row.get("threshold") is not None else 0.0
 
-    #collect the parameters from the row in dqm_checks table
-    check_rows = checks_df.filter(col("check_id") == check_id).collect()
-    if not check_rows:
-        return None, empty_ids, empty_ids
-    
-    query_template = check_rows[0]["query_template"] 
-    
-    start_time = datetime.now()
-    source_df.createOrReplaceTempView("source_table")
-    
-    
-    # fill in the query template
-    validation_query = query_template.replace("{table_name}", "source_table").replace("{column_name}", target_column)
-    # will need to a additional check parameter eg. for length check - we'll need length for that column
+    check_def = checks_index.get(check_id)
+    if not check_def:
+        log.warning("check_id=%d not found in checks table – skipping.", check_id)
+        return None, set()
 
-    #inject dynmaic params from check_params if present
-    raw_params = config_row["check_params"]
+    query_template: str = check_def["query_template"]
 
+    # Replace standard placeholders
+    # The template must SELECT record_id for failing rows
+    validation_query = (
+        query_template
+        .replace("{table_name}", f'"{schema}"."{source_table}"')
+        .replace("{column_name}", target_column)
+    )
+
+    # Inject dynamic params from check_params if present
+    raw_params = config_row.get("check_params")
     if raw_params:
         try:
             check_params = json.loads(raw_params)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in check_params for check_id={check_id}: {raw_params}") from e
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid JSON in check_params for check_id={check_id}: {raw_params!r}"
+            ) from exc
 
         for param_key, param_value in check_params.items():
             placeholder = "{" + param_key + "}"
             if placeholder in validation_query:
                 validation_query = validation_query.replace(placeholder, str(param_value))
 
-    # Catch any placeholders that weren't filled
+    # Guard: catch any remaining unfilled placeholders
     unfilled = re.findall(r"\{(\w+)\}", validation_query)
     if unfilled:
         raise ValueError(
             f"check_id={check_id} has unfilled placeholders {unfilled}. "
-            f"Add these keys to check_params in ctrl_dqm_master."
+            "Add these keys to check_params in ctrl_dqm_master."
         )
 
-    # run the query   
-    failed_record_ids = spark.sql(validation_query).select("record_id").distinct()
+    log.debug("check_id=%d  query: %s", check_id, validation_query)
 
+    start_time = datetime.now()
 
-    # counts
-    total_rows = source_df.count()
-    failed_count = failed_record_ids.count()
-    passed_count = total_rows - failed_count
+    with db_cursor(conn) as cur:
+        cur.execute(validation_query)
+        failed_rows = cur.fetchall()
+
+    failed_ids = {str(r["record_id"]) for r in failed_rows}
+
+    failed_count   = len(failed_ids)
+    passed_count   = total_rows - failed_count
     execution_time = (datetime.now() - start_time).total_seconds()
+    fail_pct       = (failed_count / total_rows * 100) if total_rows > 0 else 0.0
+    status         = "FAIL" if fail_pct > threshold else "PASS"
 
-    fail_pct = (failed_count / total_rows * 100) if total_rows > 0 else 0.0
-    status = "FAIL" if fail_pct > threshold else "PASS"
-
-    # create the record for the log table
-    log_record = {
-        "batch_id": int(batch_id),
-        "check_id": int(check_id),
-        "target_table": str(target_table),
-        "target_column": str(target_column),
-        "total_rows": int(total_rows),
-        "passed_rows": int(passed_count),
-        "failed_rows": int(failed_count),
-        "threshold": float(threshold),
-        "status": str(status),
-        "criticality": int(criticality),
-        "run_timestamp": run_timestamp,
-        "execution_time": float(execution_time),
-        "quarantine_table": str(quarantine_table),
-        "passed_table": str(passed_table),
-    }
-
-    # assign hard-fail ids and soft-fail ids
-    hard_ids = failed_record_ids if criticality == HARD_FAIL else empty_ids
-    soft_ids = failed_record_ids if criticality == SOFT_FAIL else empty_ids
-    return log_record, hard_ids, soft_ids
-
-# creates passed_df and quarantined_df according to priority 
-def classify_records(spark, source_df, hard_ids, soft_ids):
-    pure_soft_ids = soft_ids.subtract(hard_ids)
-    all_failed_ids = hard_ids.union(soft_ids).distinct()
-    clean_ids = source_df.select("record_id").subtract(all_failed_ids)
-
-    quarantined_df = source_df.join(hard_ids, on="record_id", how="inner").dropDuplicates(["record_id"])
-    passed_ids = clean_ids.union(pure_soft_ids).distinct()
-    passed_df = source_df.join(passed_ids, on="record_id", how="inner").dropDuplicates(["record_id"])
-    return passed_df, quarantined_df
-
-
-#code to write to respective tables
-def persist_results(spark, log_records, dqm_logs_table, passed_df, passed_table, quarantined_df, quarantine_table):
-    if log_records:
-        log_schema = get_table_schema(spark, dqm_logs_table)
-        logs_df = spark.createDataFrame(log_records, schema=log_schema)
-        logs_df.write.format("delta").mode("append").saveAsTable(dqm_logs_table)
-    
-    passed_df.write.format("delta").mode("overwrite").saveAsTable(passed_table)
-    quarantined_df.write.format("delta").mode("overwrite").saveAsTable(quarantine_table)
-
-# function to bring it all together
-
-def run_dqm_pipeline(catalog, schema,ctrl_dqm_master,ctrl_dqm_type,source,quarantine_table,passed_table,log_table):
-    ns = f"{catalog}.{schema}"
-    spark = get_spark()
-    batch_id = generate_batch_id()
-    run_timestamp = datetime.now()
-    
-    config_df = load_config(spark, f"{ns}.{ctrl_dqm_master}")
-    checks_df = load_checks(spark, f"{ns}.{ctrl_dqm_type}")
-    source_df = load_source(spark, f"{ns}.{source}")
-
-    record_id_field = source_df.schema["record_id"]
-    hard_ids = spark.createDataFrame([], StructType([record_id_field]))
-    soft_ids = hard_ids
-    log_records = []
-
-    for config_row in config_df.collect():
-        log_record, r_hard, r_soft = run_single_check(
-            spark, source_df, config_row, checks_df, batch_id, 
-            run_timestamp, f"{ns}.{quarantine_table}", f"{ns}.{passed_table}"
-        )
-        if log_record:
-            log_records.append(log_record)
-            hard_ids = hard_ids.union(r_hard).distinct()
-            soft_ids = soft_ids.union(r_soft).distinct()
-
-    passed_df, quarantined_df = classify_records(spark, source_df, hard_ids, soft_ids)
-    
-    persist_results(
-        spark, log_records, f"{ns}.{log_table}", 
-        passed_df, f"{ns}.{passed_table}", 
-        quarantined_df, f"{ns}.{quarantine_table}"
+    log.info(
+        "check_id=%d  status=%s  failed=%d/%d (%.2f%%)  threshold=%.2f%%",
+        check_id, status, failed_count, total_rows, fail_pct, threshold,
     )
 
-    return {"batch_id": batch_id, "passed": passed_df.count(), "quarantined": quarantined_df.count()}
+    log_record = {
+        "batch_id":         batch_id,
+        "check_id":         check_id,
+        "target_table":     target_table,
+        "target_column":    target_column,
+        "total_rows":       total_rows,
+        "passed_rows":      passed_count,
+        "failed_rows":      failed_count,
+        "threshold":        threshold,
+        "status":           status,
+        "criticality":      criticality,
+        "run_timestamp":    run_timestamp,
+        "execution_time":   execution_time,
+        "quarantine_table": quarantine_table,
+        "passed_table":     passed_table,
+    }
 
-#run
-run_dqm_pipeline("com_edp_dev"
-,"com_raw"
-,"ctrl_dqm_master"
-,"ctrl_dqm_type"
-,"dqm_staging"
-,"dqm_quarantined_records"
-,"dqm_passed_records"
-,"dqm_log")
+    return log_record, failed_ids
+
+
+# ---------------------------------------------------------------------------
+# Record classification  (pure Python sets)
+# ---------------------------------------------------------------------------
+
+def classify_records(
+    all_ids: list[str],
+    hard_fail_ids: set[str],
+    soft_fail_ids: set[str],
+) -> tuple[set[str], set[str]]:
+    """
+    Partition record_ids into passed and quarantined.
+
+    Rules
+    -----
+    - Hard-fail                        → quarantined
+    - Soft-fail only (not hard-fail)   → passed
+    - Clean (no failure at all)        → passed
+    """
+    quarantined = hard_fail_ids
+    passed      = set(all_ids) - quarantined
+    return passed, quarantined
+
+
+# ---------------------------------------------------------------------------
+# Persist results back to Redshift via psycopg2
+# ---------------------------------------------------------------------------
+
+def _ids_to_temp_table(conn, cur, ids: set[str], temp_table_name: str) -> None:
+    """
+    Load a set of record_ids into a temporary table for use in INSERT … SELECT.
+    Creates the temp table if it doesn't exist yet.
+    """
+    cur.execute(f"""
+        CREATE TEMP TABLE IF NOT EXISTS {temp_table_name} (
+            record_id VARCHAR(256)
+        )
+        DISTKEY(record_id)
+    """)
+    if ids:
+        psycopg2.extras.execute_values(
+            cur,
+            f"INSERT INTO {temp_table_name} (record_id) VALUES %s",
+            [(rid,) for rid in ids],
+        )
+
+
+def persist_passed(conn, schema: str, source: str, passed_ids: set[str], passed_table: str) -> None:
+    """Overwrite passed_table with rows whose record_id is in passed_ids."""
+    if not passed_ids:
+        log.warning("No passed records to write.")
+        return
+
+    with db_cursor(conn) as cur:
+        _ids_to_temp_table(conn, cur, passed_ids, "_tmp_passed_ids")
+        cur.execute(f'TRUNCATE "{schema}"."{passed_table}"')
+        cur.execute(f"""
+            INSERT INTO "{schema}"."{passed_table}"
+            SELECT s.*
+            FROM "{schema}"."{source}" s
+            JOIN _tmp_passed_ids t ON s.record_id = t.record_id
+        """)
+
+    log.info("Wrote %d passed record(s) to %s.%s", len(passed_ids), schema, passed_table)
+
+
+def persist_quarantined(conn, schema: str, source: str, quarantine_ids: set[str], quarantine_table: str) -> None:
+    """Overwrite quarantine_table with rows whose record_id is in quarantine_ids."""
+    with db_cursor(conn) as cur:
+        _ids_to_temp_table(conn, cur, quarantine_ids, "_tmp_quarantine_ids")
+        cur.execute(f'TRUNCATE "{schema}"."{quarantine_table}"')
+        if quarantine_ids:
+            cur.execute(f"""
+                INSERT INTO "{schema}"."{quarantine_table}"
+                SELECT s.*
+                FROM "{schema}"."{source}" s
+                JOIN _tmp_quarantine_ids t ON s.record_id = t.record_id
+            """)
+
+    log.info("Wrote %d quarantined record(s) to %s.%s", len(quarantine_ids), schema, quarantine_table)
+
+
+def persist_log(conn, schema: str, log_table: str, log_records: list[dict]) -> None:
+    """Append DQM log records to the log table."""
+    if not log_records:
+        return
+
+    columns = list(log_records[0].keys())
+    col_str = ", ".join(f'"{c}"' for c in columns)
+    values  = [[r[c] for c in columns] for r in log_records]
+
+    sql = f'INSERT INTO "{schema}"."{log_table}" ({col_str}) VALUES %s'
+
+    with db_cursor(conn) as cur:
+        psycopg2.extras.execute_values(cur, sql, values)
+
+    log.info("Wrote %d log record(s) to %s.%s", len(log_records), schema, log_table)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline entry point
+# ---------------------------------------------------------------------------
+
+def run_dqm_pipeline(
+    schema: str,
+    ctrl_dqm_master: str,
+    ctrl_dqm_type: str,
+    source: str,
+    quarantine_table: str,
+    passed_table: str,
+    log_table: str,
+) -> dict:
+    """
+    Orchestrate the full DQM pipeline using pure Python + psycopg2.
+
+    - Reads control tables and source data directly from Redshift.
+    - Runs each validation query on Redshift (no local data movement).
+    - Classifies records in Python using set operations.
+    - Writes passed/quarantined/log results back to Redshift.
+    """
+    batch_id      = generate_batch_id()
+    run_timestamp = datetime.now()
+
+    log.info("Starting DQM pipeline  batch_id=%d", batch_id)
+
+    conn = get_db_conn()
+    try:
+        # ── 1. Load control tables ──────────────────────────────────────────
+        config_rows   = load_config(conn, schema, ctrl_dqm_master)
+        checks_index  = load_checks(conn, schema, ctrl_dqm_type)
+        all_ids       = load_source_ids(conn, schema, source)
+        total_rows    = len(all_ids)
+
+        # ── 2. Run each check ───────────────────────────────────────────────
+        hard_fail_ids: set[str] = set()
+        soft_fail_ids: set[str] = set()
+        log_records:   list[dict] = []
+
+        for config_row in config_rows:
+            log_record, failed_ids = run_single_check(
+                conn=conn,
+                schema=schema,
+                source_table=source,
+                config_row=config_row,
+                checks_index=checks_index,
+                total_rows=total_rows,
+                batch_id=batch_id,
+                run_timestamp=run_timestamp,
+                quarantine_table=quarantine_table,
+                passed_table=passed_table,
+            )
+
+            if log_record:
+                log_records.append(log_record)
+                criticality = int(config_row["criticality"])
+                if criticality == HARD_FAIL:
+                    hard_fail_ids |= failed_ids
+                else:
+                    soft_fail_ids |= failed_ids
+
+        # ── 3. Classify ─────────────────────────────────────────────────────
+        passed_ids, quarantine_ids = classify_records(all_ids, hard_fail_ids, soft_fail_ids)
+
+        # ── 4. Persist ──────────────────────────────────────────────────────
+        persist_passed(conn, schema, source, passed_ids, passed_table)
+        persist_quarantined(conn, schema, source, quarantine_ids, quarantine_table)
+        persist_log(conn, schema, log_table, log_records)
+
+    finally:
+        conn.close()
+        log.info("Redshift connection closed.")
+
+    result = {
+        "batch_id":    batch_id,
+        "passed":      len(passed_ids),
+        "quarantined": len(quarantine_ids),
+    }
+    log.info("DQM pipeline complete  %s", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Run DQM pipeline against Redshift")
+
+    parser.add_argument("--schema",            required=True, help="Redshift schema name")
+    parser.add_argument("--ctrl_dqm_master",   required=True, help="Config/master table name")
+    parser.add_argument("--ctrl_dqm_type",     required=True, help="Check definitions table name")
+    parser.add_argument("--source",            required=True, help="Source/staging table name")
+    parser.add_argument("--quarantine_table",  required=True, help="Quarantine output table name")
+    parser.add_argument("--passed_table",      required=True, help="Passed output table name")
+    parser.add_argument("--log_table",         required=True, help="DQM log table name")
+
+    args = parser.parse_args()
+
+    # Validate env vars early so errors surface before any DB work
+    _get_required_env("REDSHIFT_HOST")
+    _get_required_env("REDSHIFT_DATABASE")
+    _get_required_env("REDSHIFT_USER")
+    _get_required_env("REDSHIFT_CLUSTER_ID")
+
+    try:
+        run_dqm_pipeline(
+            schema=args.schema,
+            ctrl_dqm_master=args.ctrl_dqm_master,
+            ctrl_dqm_type=args.ctrl_dqm_type,
+            source=args.source,
+            quarantine_table=args.quarantine_table,
+            passed_table=args.passed_table,
+            log_table=args.log_table,
+        )
+    except Exception:
+        log.exception("DQM pipeline failed")
+        raise SystemExit(1)
